@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.2-local.1
+
+- Run one-shot `agy` CLI probes (`execOnce`: `agy models` and `--version`) in an isolated temporary directory and remove it on exit, preventing plugin hosts such as Magpie from defaulting `cwd` to `~/.config/magpie/plugin-work` and registering it as an Antigravity project.
+- On Linux, connect the client MCP adapter over a private, token-authenticated Unix socket (`AGY_BRIDGE_CONTROL_SOCKET`) so `agy` can run in its existing network namespace without exposing host networking. Retain loopback TCP on macOS and Windows, and never fall back to TCP when an explicit Unix endpoint fails.
+- Bound cold tool-catalog confirmation (`TOOL_LIST_WAIT_MS`) at 30 seconds instead of 5 seconds while preserving explicit `AGY_BRIDGE_TOOL_LIST_WAIT_MS` overrides. (Client MCP `allow_once` confirmation and empty-turn detection are now provided natively by upstream `0.8.5`–`0.9.2`.)
+
 ## 0.9.2
 
 - Sign an existing named account in again from **Add a Google account** or **Import an account** by entering its name (case-insensitive). Only its credential file is replaced, staged in the same folder and renamed over the old one; conversations, settings and logs stay, and any failure keeps the previous credential. Previously an existing folder refused the name, so an account whose Magpie row had been removed could not be added back. Manifest imports still never overwrite.

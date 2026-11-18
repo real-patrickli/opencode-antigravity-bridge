@@ -1,6 +1,9 @@
 import assert from "node:assert/strict"
 import { spawn } from "node:child_process"
 import net from "node:net"
+import fs from "node:fs/promises"
+import os from "node:os"
+import path from "node:path"
 import readline from "node:readline"
 import { setTimeout as delay } from "node:timers/promises"
 import { test } from "node:test"
@@ -31,7 +34,7 @@ async function withTimeout(promise, description, timeoutMs = 3000) {
   }
 }
 
-async function createControlServer(t, tools = []) {
+async function createControlServer(t, tools = [], unixSocket = false) {
   const requests = []
   const sockets = new Set()
   const watchers = new Set()
@@ -83,17 +86,22 @@ async function createControlServer(t, tools = []) {
     })
   })
 
+  const socketDir = unixSocket ? await fs.mkdtemp(path.join(os.tmpdir(), "m-")) : null
+  const socketPath = socketDir ? path.join(socketDir, "s") : null
   await new Promise((resolve, reject) => {
     server.once("error", reject)
-    server.listen(0, "127.0.0.1", resolve)
+    if (socketPath) server.listen(socketPath, resolve)
+    else server.listen(0, "127.0.0.1", resolve)
   })
   t.after(async () => {
     for (const socket of sockets) socket.destroy()
     if (server.listening) await new Promise(resolve => server.close(resolve))
+    if (socketDir) await fs.rm(socketDir, { recursive: true, force: true })
   })
 
   return {
-    port: server.address().port,
+    port: socketPath ? 1 : server.address().port,
+    socketPath,
     requests,
     watchers,
     get watchConnections() {
@@ -102,11 +110,12 @@ async function createControlServer(t, tools = []) {
   }
 }
 
-function createMcpProcess(t, port) {
+function createMcpProcess(t, port, socketPath = "") {
   const child = spawn(process.execPath, [MCP_SERVER], {
     env: {
       ...process.env,
       AGY_BRIDGE_CONTROL_PORT: String(port),
+      AGY_BRIDGE_CONTROL_SOCKET: socketPath,
       AGY_BRIDGE_TOKEN: TOKEN,
       AGY_BRIDGE_MCP_TRACE: "",
     },
@@ -174,6 +183,46 @@ async function initialize(mcp) {
   assert.equal(response.result.protocolVersion, "2025-11-25")
   assert.equal(response.result.capabilities.tools.listChanged, true)
 }
+
+test("Unix control socket supports authenticated tool lists, calls and watch notifications", { skip: process.platform === "win32" }, async t => {
+  const control = await createControlServer(t, [{ name: "echo", inputSchema: { type: "object" } }], true)
+  const mcp = createMcpProcess(t, control.port, control.socketPath)
+  await initialize(mcp)
+  const listed = await mcp.request("unix-list", "tools/list")
+  assert.equal(listed.result.tools[0].name, "echo")
+  assert.equal(listed.result.tools[0]._meta["antigravity/alwaysLoad"], true)
+  const result = await mcp.request("unix-call", "tools/call", { name: "echo", arguments: { text: "probe" } })
+  assert.equal(result.result.content[0].text, "echo")
+  assert.equal(control.requests.find(x => x.kind === "call").token, TOKEN)
+  mcp.notify("notifications/initialized")
+  await waitUntil(() => control.watchers.size === 1, "Unix watch connection")
+  for (const watcher of control.watchers) watcher.write(JSON.stringify({ event: "tools_changed" }) + "\n")
+  await waitUntil(() => mcp.messages.some(x => x.method === "notifications/tools/list_changed"), "Unix tools changed notification")
+  await mcp.close()
+  await waitUntil(() => control.watchers.size === 0, "Unix watch cleanup")
+})
+
+test("an unreachable Unix socket never falls back to a reachable TCP control port", { skip: process.platform === "win32" }, async t => {
+  const control = await createControlServer(t)
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "m-"))
+  t.after(() => fs.rm(dir, { recursive: true, force: true }))
+  const mcp = createMcpProcess(t, control.port, path.join(dir, "missing"))
+  await initialize(mcp)
+  const result = await mcp.request("missing-unix", "tools/list")
+  assert.equal(result.error.code, -32603)
+  assert.equal(control.requests.length, 0)
+  await mcp.close()
+})
+
+test("a relative control socket path fails configuration before making a connection", async t => {
+  const control = await createControlServer(t)
+  const mcp = createMcpProcess(t, control.port, "relative.sock")
+  await initialize(mcp)
+  const result = await mcp.request("bad-unix", "tools/list")
+  assert.equal(result.error.message, "Bridge control channel is not configured")
+  assert.equal(control.requests.length, 0)
+  await mcp.close()
+})
 
 test("tools/list marks every tool always loaded and preserves metadata", async t => {
   const control = await createControlServer(t, [

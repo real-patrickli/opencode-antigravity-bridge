@@ -98,7 +98,9 @@ const SUPERSEDED_NOTE = "agy bridge: this tool call was superseded because the c
 const SELF_POLL_IDLE_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_SELF_POLL_IDLE_TIMEOUT_MS, 20 * 60 * 1000)
 const SELF_POLL_LIMIT = positiveTimeout(process.env.AGY_BRIDGE_SELF_POLL_LIMIT, 8)
 const SELF_POLL_NOTE = "agy bridge: gave up waiting for this tool: the client never returned a result for it; stop this turn"
-const TOOL_LIST_WAIT_MS = 5_000
+// Cold CLI startup and large tool catalogs can outlive a five-second wait.
+// Still require an authenticated tools/list before submitting any model prompt.
+const TOOL_LIST_WAIT_MS = 30_000
 const STDERR_TAIL = 32 * 1024
 const CONTROL_LINE_LIMIT = 16 * 1024 * 1024
 const ACP_LINE_LIMIT = 64 * 1024 * 1024
@@ -172,6 +174,9 @@ const promptAttempts = new Map()
 let cachedAgyPath
 let controlServer
 let controlServerPromise
+let controlSocketServer
+let controlSocketDir
+let controlSocketPath
 let shimDir
 let shimDirPromise
 
@@ -247,23 +252,43 @@ function agyUnlocked() {
   return cachedAgyUnlocked
 }
 
-function execOnce(file, args, opts = {}) {
+async function execOnce(file, args, opts = {}) {
+  const isTaskkill = file === "taskkill"
+  let ownedCwd = null
+  if (!isTaskkill && (opts.cwd == null || opts.cwd === "")) {
+    try {
+      ownedCwd = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-exec-"))
+    } catch (err) {
+      return { err, stdout: "", stderr: "", code: null, timedOut: false }
+    }
+  }
+  const cleanup = () => ownedCwd
+    ? fs.promises.rm(ownedCwd, { recursive: true, force: true }).catch(() => {})
+    : Promise.resolve()
   return new Promise((resolve) => {
     let child
     try {
-      const launch = file === "taskkill" ? spawn : spawnAgy
+      const launch = isTaskkill ? spawn : spawnAgy
       child = launch(file, args, {
         stdio: ["ignore", "pipe", "pipe"],
         ...opts,
+        ...(ownedCwd ? { cwd: ownedCwd } : {}),
         windowsHide: true,
       })
     } catch (err) {
-      resolve({ err, stdout: "", stderr: "", code: null, timedOut: false })
+      void cleanup().then(() => resolve({ err, stdout: "", stderr: "", code: null, timedOut: false }))
       return
     }
     let stdout = ""
     let stderr = ""
     let timedOut = false
+    let settled = false
+    const finish = (result) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      void cleanup().then(() => resolve(result))
+    }
     const timer = setTimeout(() => {
       timedOut = true
       try { child.kill("SIGKILL") } catch {}
@@ -271,12 +296,10 @@ function execOnce(file, args, opts = {}) {
     child.stdout.on("data", (data) => { stdout += data })
     child.stderr.on("data", (data) => { stderr += data })
     child.on("error", (err) => {
-      clearTimeout(timer)
-      resolve({ err, stdout, stderr, code: null, timedOut })
+      finish({ err, stdout, stderr, code: null, timedOut })
     })
     child.on("close", (code) => {
-      clearTimeout(timer)
-      resolve({ err: null, stdout, stderr, code, timedOut })
+      finish({ err: null, stdout, stderr, code, timedOut })
     })
   })
 }
@@ -1558,6 +1581,7 @@ class Proc {
           ...(!distro ? { PATH: bin + path.delimiter + inheritedPath } : {}),
           ...(distro ? { AGY_BRIDGE_WSL_BIN: wslPath(bin, distro) } : {}),
           AGY_BRIDGE_CONTROL_PORT: String(controlServer.address().port),
+          AGY_BRIDGE_CONTROL_SOCKET: controlSocketPath || "",
           AGY_BRIDGE_TOKEN: this.token,
           AGY_CLI_DISABLE_AUTO_UPDATE: "true",
         },
@@ -5213,6 +5237,31 @@ function ensureControlServer() {
       server.unref()
       resolve(server.address().port)
     })
+  }).then(async port => {
+    // A filesystem socket crosses Linux network namespaces without exposing
+    // host networking or altering AGY's proxy/egress isolation. AGY still gets
+    // its numeric IDE port; the private nc adapter uses this authenticated IPC.
+    if (process.platform !== "linux" || wslDistro()) return port
+    try {
+      controlSocketDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "agy-ipc-"))
+      await fs.promises.chmod(controlSocketDir, 0o700)
+      controlSocketPath = path.join(controlSocketDir, "control.sock")
+      const server = net.createServer(socket => handleControlConnection(socket))
+      controlSocketServer = server
+      await new Promise((resolve, reject) => {
+        server.once("error", reject)
+        server.listen(controlSocketPath, resolve)
+      })
+      await fs.promises.chmod(controlSocketPath, 0o600)
+      server.unref()
+      return port
+    } catch (error) {
+      controlSocketServer?.close()
+      controlServer?.close()
+      if (controlSocketDir) await fs.promises.rm(controlSocketDir, { recursive: true, force: true })
+      controlSocketPath = null
+      throw error
+    }
   })
   return controlServerPromise
 }
@@ -6697,6 +6746,10 @@ process.once("exit", () => {
   }
   if (shimDir) {
     try { fs.rmSync(shimDir, { recursive: true, force: true }) } catch {}
+  }
+  controlSocketServer?.close()
+  if (controlSocketDir) {
+    try { fs.rmSync(controlSocketDir, { recursive: true, force: true }) } catch {}
   }
 })
 

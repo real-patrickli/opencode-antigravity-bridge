@@ -1172,6 +1172,29 @@ test("execOnce agy branch forces hidden windows and disables updates without mut
   })
 })
 
+test("execOnce agy branch isolates omitted or empty cwd in a temporary directory and cleans it up", async () => {
+  let observedExisted = false
+  await captureExec(async (calls, delays) => {
+    const wrapped = childProcess.spawn
+    childProcess.spawn = (file, args, options) => {
+      observedExisted = Boolean(options?.cwd && fs.existsSync(options.cwd))
+      return wrapped(file, args, options)
+    }
+    syncBuiltinESMExports()
+    for (const opts of [undefined, {}, { cwd: "" }]) {
+      observedExisted = false
+      const result = await execOnce("agy", ["models"], opts)
+      assert.equal(result.code, 7)
+      const cwd = calls.at(-1).options.cwd
+      assert.equal(typeof cwd, "string")
+      assert.ok(path.basename(cwd).startsWith("magpie-agy-exec-"))
+      assert.equal(observedExisted, true, "temporary cwd must exist when child starts")
+      assert.equal(fs.existsSync(cwd), false, "temporary cwd must be removed before execOnce resolves")
+    }
+    assert.deepEqual(delays, [30000, 30000, 30000])
+  })
+})
+
 test("execOnce taskkill uses generic spawn, keeps caller env and cannot expose a window", async () => {
   await captureExec(async (calls, delays) => {
     const args = Object.freeze(["/T", "/F", "/PID", "12345"])

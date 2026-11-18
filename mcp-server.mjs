@@ -1,5 +1,6 @@
 import fs from "node:fs"
 import net from "node:net"
+import path from "node:path"
 
 const PROTOCOL_VERSION = "2025-11-25"
 const { version } = JSON.parse(fs.readFileSync(new URL("./package.json", import.meta.url), "utf8"))
@@ -12,9 +13,13 @@ const WATCH_RECONNECT_MAX_MS = 2000
 const WATCH_RECONNECT_MAX_ATTEMPTS = 6
 const CONTROL_PORT = Number(process.env.AGY_BRIDGE_CONTROL_PORT)
 const CONTROL_TOKEN = process.env.AGY_BRIDGE_TOKEN
-const CONTROL_CONFIGURED = Number.isInteger(CONTROL_PORT)
+const CONTROL_SOCKET = process.env.AGY_BRIDGE_CONTROL_SOCKET || ""
+const CONTROL_ADDRESS = CONTROL_SOCKET
+  ? { path: CONTROL_SOCKET }
+  : { host: "127.0.0.1", port: CONTROL_PORT }
+const CONTROL_CONFIGURED = (CONTROL_SOCKET ? path.isAbsolute(CONTROL_SOCKET) : Number.isInteger(CONTROL_PORT)
   && CONTROL_PORT >= 1
-  && CONTROL_PORT <= 65535
+  && CONTROL_PORT <= 65535)
   && typeof CONTROL_TOKEN === "string"
   && CONTROL_TOKEN.length > 0
 
@@ -124,7 +129,7 @@ function controlRequest(payload) {
 
     let socket
     try {
-      socket = net.createConnection({ host: "127.0.0.1", port: CONTROL_PORT })
+      socket = net.createConnection(CONTROL_ADDRESS)
     } catch {
       finish(failure())
       return
@@ -212,7 +217,7 @@ function startWatch(reconnecting = false) {
   if (!reconnecting) watchReconnectAttempts = 0
   let socket
   try {
-    socket = net.createConnection({ host: "127.0.0.1", port: CONTROL_PORT })
+    socket = net.createConnection(CONTROL_ADDRESS)
   } catch {
     scheduleWatchReconnect()
     return
